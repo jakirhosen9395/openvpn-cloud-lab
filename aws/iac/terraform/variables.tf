@@ -41,6 +41,12 @@ variable "private_subnet_cidr" {
   default     = "10.0.2.0/24"
 }
 
+variable "enable_private_networking" {
+  description = "Create the private subnet + NAT gateway (and private route table/EIP/SG). Default false = lean VPN-only VPC: cheaper (~$32/mo less) and faster/cleaner to destroy. Set true to model a full public+private VPC."
+  type        = bool
+  default     = false
+}
+
 variable "vpn_client_cidr" {
   description = "IP range OpenVPN hands out to connected VPN clients (the tunnel subnet)."
   type        = string

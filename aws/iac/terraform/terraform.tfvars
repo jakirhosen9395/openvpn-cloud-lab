@@ -17,6 +17,8 @@ private_subnet_cidr = "10.0.2.0/24"
 vpn_client_cidr     = "10.8.0.0/24"
 availability_zone   = "ap-south-1a"
 
+# enable_private_networking = false  # true = also build private subnet + NAT gateway (adds ~$32/mo)
+
 instance_type = "t3.micro"
 
 # SSH key pair is created/managed by Terraform from ~/.ssh/ovpn-admin.pub
