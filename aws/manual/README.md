@@ -1332,6 +1332,333 @@ cat /var/log/openvpn/status.log
 
 ---
 
+## Phase 6 - Cleanup and Resource Destruction
+
+> **Why this matters.** Several resources keep billing **even when idle**: the **NAT Gateway**
+> (~$0.045/hr ≈ **$32+/month** plus data processing), each **Elastic IP** while allocated
+> (~$0.005/hr ≈ $3.6/mo), and **EBS volumes**. Terminating the EC2 instance alone does **not** stop
+> these charges. This phase removes everything in a **dependency-safe order** so nothing is orphaned
+> and your account returns to its original state.
+
+> **Order matters.** AWS refuses to delete a resource while something still depends on it (you get
+> `DependencyViolation`). Remove from the inside out: **clients → server EIP → instance → EBS →
+> security groups → NAT Gateway → NAT EIP → routes → internet gateway → subnets → VPC**.
+
+![Teardown order](./images/cleanup-order.png)
+
+### 1. Disconnect VPN Clients
+
+**Purpose:** Stop active tunnels and preserve anything you still need before the server is destroyed.
+
+**AWS Console Navigation:** _(client-side — done in your OpenVPN client, not the AWS Console)_
+
+**Steps:**
+
+1. In **OpenVPN Connect** (or your CLI client), **disconnect** every active profile (`admin_user`, etc.).
+2. If you want to keep a profile, copy it now from `aws/iac/vpn-clients/<name>.ovpn` to a safe place — it becomes useless once the server's CA is gone.
+3. (Optional) Revoke users you no longer want — not required, since the whole PKI is about to be destroyed.
+
+**Expected Result:** No active VPN connections; any profiles you care about are backed up locally.
+
+**Validation:**
+
+- [ ] All clients disconnected
+- [ ] Needed `.ovpn` profiles backed up
+
+### 2. Remove OpenVPN Configuration
+
+**Purpose:** Optionally back up the server's PKI/config before the instance (and its disk) are deleted.
+
+> ⚠️ **Irreversible.** Once the EC2 instance is terminated, the CA, server key, `tls-crypt.key`, and all
+> issued client certificates are **gone permanently**. Existing `.ovpn` files will no longer
+> authenticate against a freshly rebuilt server.
+
+**AWS Console Navigation:** `EC2 → Instances` → connect via **Session Manager** (or SSH)
+
+**Steps:**
+
+1. Connect to the server one last time (SSM Session Manager or SSH).
+2. (Optional) Archive the PKI/config in case you want to study it later:
+```bash
+sudo tar -czf /tmp/openvpn-backup.tgz /etc/openvpn/server /etc/openvpn/easy-rsa/pki
+```
+3. Download `/tmp/openvpn-backup.tgz` if desired, then proceed to teardown.
+
+**Expected Result:** A local backup exists if you wanted one; otherwise nothing to do — the next steps delete it all.
+
+**Validation:**
+
+- [ ] Backup taken (if desired) **or** confirmed not needed
+
+### 3. Release Elastic IP (server)
+
+**Purpose:** Free the server's static public IP. **Allocated Elastic IPs bill (~$0.005/hr ≈ $3.6/mo)** whether attached or not.
+
+**AWS Console Navigation:** `EC2 → Network & Security → Elastic IPs`
+
+**Steps:**
+
+1. Identify the **server** EIP — the one **Associated** with your VPN instance (`ovpn-dev-openvpn`). _(The other EIP belongs to the NAT Gateway — leave it until step 8.)_
+2. Select it → **Actions → Disassociate Elastic IP address** → confirm.
+3. With it still selected → **Actions → Release Elastic IP addresses** → confirm.
+
+![Release Elastic IP](./images/release-eip.png)
+
+**Expected Result:** The server EIP disappears from the list.
+
+**Validation:**
+
+- [ ] Server EIP disassociated
+- [ ] Server EIP released
+
+### 4. Terminate EC2 Instance
+
+**Purpose:** Stop compute charges by destroying the VPN server.
+
+**AWS Console Navigation:** `EC2 → Instances`
+
+**Steps:**
+
+1. Find the instance named **`ovpn-dev-openvpn`** (subnet `ovpn-dev-public-subnet`, key pair `ovpn-admin`).
+2. Select it → **Instance state → Terminate (delete) instance** → confirm.
+3. Wait until **Instance state = `Terminated`** (1–2 minutes).
+
+**Expected Result:** Instance shows `Terminated`; compute billing stops.
+
+> ℹ️ The **root EBS volume is delete-on-termination**, so it is removed automatically here. Step 5 catches any *extra* volumes.
+
+**Validation:**
+
+- [ ] Instance terminated
+- [ ] Compute charges stopped
+
+### 5. Delete EBS Volumes
+
+**Purpose:** Remove leftover storage. **Unattached EBS volumes still bill** (~$0.092/GiB-month for `gp3`).
+
+**AWS Console Navigation:** `EC2 → Elastic Block Store → Volumes`
+
+**Steps:**
+
+1. Filter by **State = `available`** (unattached).
+2. Confirm a volume belongs to this lab — **8 GiB**, `gp3`, created at your deployment time; check its **Tags**.
+3. Select it → **Actions → Delete volume** → confirm.
+
+**Expected Result:** No `available` lab volumes remain (the root volume was already removed in step 4).
+
+**Validation:**
+
+- [ ] No unattached lab volumes remain
+
+### 6. Delete Security Group
+
+**Purpose:** Remove the custom firewalls **`ovpn-dev-openvpn-sg`** and **`ovpn-dev-private-sg`**.
+
+**AWS Console Navigation:** `VPC → Security → Security groups`
+
+**Steps:**
+
+1. Select **`ovpn-dev-openvpn-sg`** → **Actions → Delete security groups** → confirm.
+2. Repeat for **`ovpn-dev-private-sg`**.
+3. Leave the VPC's `default` group — it is removed with the VPC (step 12).
+
+> **Common error — `DependencyViolation`.** A security group can't be deleted while a network interface
+> still uses it. Ensure the instance (step 4) is fully **terminated** first. If one group references the
+> other in a rule, remove that rule (or just delete both after the instance is gone).
+
+**Expected Result:** Both custom security groups are gone.
+
+**Validation:**
+
+- [ ] `ovpn-dev-openvpn-sg` deleted
+- [ ] `ovpn-dev-private-sg` deleted
+
+### 7. Delete NAT Gateway
+
+**Purpose:** Stop the **single most expensive** resource in the lab.
+
+> ⚠️ NAT Gateways continue generating charges until deleted.
+
+> 💸 **Estimated cost:** ~**$0.045/hour (~$32+/month)** plus per-GB data processing — billed continuously until deleted.
+
+**AWS Console Navigation:** `VPC → Virtual private cloud → NAT gateways`
+
+**Steps:**
+
+1. Find the NAT Gateway named **`ovpn-dev-nat`** in your VPC.
+2. Select it → **Actions → Delete NAT gateway** → type `delete` → confirm.
+3. Wait until **State = `Deleted`** (1–2 minutes).
+
+![Delete NAT Gateway](./images/delete-nat.png)
+
+**Expected Result:** NAT Gateway state is `Deleted`; hourly NAT charges stop.
+
+**Validation:**
+
+- [ ] NAT Gateway deleted
+- [ ] Hourly NAT charges stopped
+
+### 8. Release NAT Elastic IP
+
+**Purpose:** Free the NAT Gateway's Elastic IP.
+
+> Deleting the NAT Gateway does **not** automatically release its Elastic IP — it stays **allocated and billing** until you release it.
+
+**AWS Console Navigation:** `EC2 → Network & Security → Elastic IPs`
+
+**Steps:**
+
+1. Wait until the NAT Gateway (step 7) is fully **Deleted** (you can't release the EIP before that).
+2. Select the remaining EIP (tagged `ovpn-dev-natgw-eip`, now **unassociated**).
+3. **Actions → Release Elastic IP addresses** → confirm.
+
+**Expected Result:** No Elastic IPs remain allocated for this lab.
+
+**Validation:**
+
+- [ ] NAT Elastic IP released
+- [ ] Zero Elastic IPs remain for this lab
+
+### 9. Delete Route Table Entries
+
+**Purpose:** Remove the custom routing (public → IGW, private → NAT).
+
+**AWS Console Navigation:** `VPC → Virtual private cloud → Route tables`
+
+**Steps:**
+
+1. Select **`ovpn-dev-public-rt`** → **Routes** tab → the `0.0.0.0/0 → igw-…` entry is now dangling; **Edit routes → remove** it (it is also removed when you delete the table).
+2. Select **`ovpn-dev-private-rt`** → its `0.0.0.0/0 → nat-…` entry became a **blackhole** when the NAT was deleted — remove it.
+3. For each custom table: **Actions → Delete route table** (first **Edit subnet associations → remove** any subnet, or do that in step 11). The **main** route table is deleted with the VPC.
+
+**Expected Result:** Both custom route tables and their routes are gone.
+
+**Validation:**
+
+- [ ] `ovpn-dev-public-rt` removed
+- [ ] `ovpn-dev-private-rt` removed
+
+### 10. Detach and Delete Internet Gateway
+
+**Purpose:** Remove the VPC's door to the internet. It must be **detached before it can be deleted**.
+
+**AWS Console Navigation:** `VPC → Virtual private cloud → Internet gateways`
+
+**Steps:**
+
+1. Select **`ovpn-dev-igw`** → **Actions → Detach from VPC** → confirm.
+2. With it still selected → **Actions → Delete internet gateway** → confirm.
+
+> **Common error — `DependencyViolation` on detach.** An IGW can't detach while any instance in the VPC
+> still has a public IP/EIP. Ensure the instance is **terminated** (step 4) and both EIPs are
+> **released** (steps 3 & 8) first.
+
+**Expected Result:** Internet Gateway detached and deleted.
+
+**Validation:**
+
+- [ ] IGW detached
+- [ ] IGW deleted
+
+### 11. Delete Subnets
+
+**Purpose:** Remove the public and private subnets.
+
+**AWS Console Navigation:** `VPC → Virtual private cloud → Subnets`
+
+**Steps:**
+
+1. Select **`ovpn-dev-public-subnet`** (`10.0.1.0/24`) → **Actions → Delete subnet** → confirm.
+2. Select **`ovpn-dev-private-subnet`** (`10.0.2.0/24`) → **Actions → Delete subnet** → confirm.
+
+> A subnet won't delete while it still has a network interface (the instance or NAT Gateway). Complete steps 4 and 7 first.
+
+**Expected Result:** Both subnets are gone.
+
+**Validation:**
+
+- [ ] Public subnet deleted
+- [ ] Private subnet deleted
+
+### 12. Delete VPC
+
+**Purpose:** Remove the VPC itself — the final container.
+
+**AWS Console Navigation:** `VPC → Virtual private cloud → Your VPCs`
+
+**Steps:**
+
+1. Select **`ovpn-dev-vpc`** (`10.0.0.0/16`).
+2. **Actions → Delete VPC**. The console lists the remaining dependents it will also remove (the default route table, security group, and network ACL) — review them.
+3. Type `delete` → confirm.
+
+> **Troubleshooting.** If the console blocks deletion, it names the blocking dependency (subnet, IGW,
+> ENI, NAT, route table). Resolve that resource (steps 4–11) and retry. The AWS-managed **default**
+> route table, security group, and network ACL are deleted automatically with the VPC.
+
+**Expected Result:** The VPC no longer appears under **Your VPCs**.
+
+**Validation:**
+
+- [ ] VPC deleted
+
+> **Non-billing leftovers (optional, for a perfectly clean account).** These cost nothing but complete
+> the teardown: the IAM role **`ovpn-dev-ssm-role`** + instance profile **`ovpn-dev-ssm-profile`**
+> (`IAM → Roles` → delete the role; the instance profile goes with it), and the SSM file-transfer S3
+> bucket **`<account-id>-ovpn-ssm-transfer`** (`S3 → Buckets` → empty, then delete). The Terraform
+> **state** S3 bucket is unrelated to this manual build — leave it.
+
+---
+
+## Cost Verification
+
+**Purpose:** Prove that no billable resource from this lab remains.
+
+**AWS Console Navigation:**
+
+```text
+AWS Billing Console       → cost trend should flatten after teardown
+EC2 → Instances           → none running
+EC2 → Elastic IPs         → none allocated
+EC2 → Volumes             → no unattached lab volumes
+VPC → NAT Gateways        → none
+VPC → Security Groups     → no custom lab groups
+VPC → Route Tables        → no custom lab tables
+VPC → Subnets / Your VPCs → no custom lab subnets/VPC
+```
+
+> 💡 Create a **Budget / billing alert** (`Billing → Budgets`) so any forgotten resource pings you next time.
+
+**Checklist:**
+
+- [ ] No running EC2 instances
+- [ ] No Elastic IPs allocated
+- [ ] No NAT Gateways
+- [ ] No unattached EBS volumes
+- [ ] No custom security groups
+- [ ] No custom route tables
+- [ ] No custom subnets
+- [ ] No custom VPC
+
+---
+
+## Environment Fully Removed
+
+Final confirmation that the lab is completely gone:
+
+- [ ] VPN inaccessible
+- [ ] EC2 terminated
+- [ ] EBS deleted
+- [ ] EIP released
+- [ ] NAT deleted
+- [ ] Route tables removed
+- [ ] Internet Gateway removed
+- [ ] Subnets removed
+- [ ] VPC removed
+- [ ] No remaining AWS charges from this lab
+
+---
+
 ## Validation Checklist
 
 **Networking**
