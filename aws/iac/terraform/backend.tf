@@ -34,7 +34,7 @@
 
 terraform {
   backend "s3" {
-    bucket       = "123456789123-terraform-s3-backend-for-test-vpc"
+    bucket       = "123456789123-terraform-s3-backend-for-test-vpc" # placeholder — replace with YOUR state bucket
     key          = "ovpn/terraform.tfstate"
     region       = "ap-south-1"
     use_lockfile = true # S3-native state locking (Terraform >= 1.10; no DynamoDB needed)

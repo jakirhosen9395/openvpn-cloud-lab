@@ -1,28 +1,5 @@
 #!/bin/bash
-# =============================================================================
-# EC2 DASHBOARD - user-data bootstrap script
-# -----------------------------------------------------------------------------
-# WHAT THIS DOES
-#   AWS runs this script ONCE as root when the EC2 instance first boots
-#   (this is called "user data"). It installs the Apache web server and
-#   publishes a small web page (a "dashboard") on port 80 that shows live
-#   information about the server: OS, EC2 details, network, IAM role,
-#   CPU, memory and disk.
-#
-#   Open it in a browser at:   http://SERVER_IP/
-#
-# DESIGN GOALS
-#   * Lowest cost / lowest internet use: installs ONLY Apache (and curl if it
-#     is missing). No full system upgrade and no extra packages.
-#   * Works on PUBLIC and PRIVATE instances. The dashboard reads data from the
-#     local machine and from the EC2 metadata service at 169.254.169.254 -
-#     a "link-local" address that works WITHOUT internet access.
-#   * Beginner friendly: short functions, plain commands, lots of comments.
-#     You can read every line, run every command by hand, and learn from it.
-# =============================================================================
 
-# Send everything this script prints (and any errors) into one log file.
-# Read it later with:   cat /var/log/ec2-dashboard-userdata.log
 exec > /var/log/ec2-dashboard-userdata.log 2>&1
 
 # Stop the script immediately if any command fails, so problems are obvious.
