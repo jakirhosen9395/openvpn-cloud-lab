@@ -33,6 +33,22 @@ firewalls / security groups · VPN internals (PKI, certs, IP forwarding, NAT, cl
 **Terraform** + **Ansible** · secure remote management without exposed SSH (e.g. **AWS SSM**) · cost
 awareness and clean teardown.
 
+## Before You Begin
+
+New to AWS or to cloud networking? Start with the onboarding hub in
+**[`aws/iac/README.md` → Before You Begin](aws/iac/README.md#before-you-begin)** — it covers AWS
+account prerequisites, the tools to install, region selection, and deployment modes for a brand-new
+user. For plain-language explanations of **VPC, Subnet, Route Table, Internet Gateway, NAT Gateway,
+Security Group, and CIDR**, see the cloud-agnostic primer in
+**[`docs/README.md` → Recommended Knowledge](docs/README.md#recommended-knowledge)**.
+
+**Deployment modes (AWS):** the lab deploys in one of two modes, set by a single variable. **VPN Only**
+(the default) builds just a public VPC + the OpenVPN server + an Elastic IP — cheapest and fastest.
+**Extended Networking** adds a private subnet and a NAT Gateway to model a real public+private VPC, at
+higher cost. Details: **[`aws/iac/README.md` → Deployment Modes](aws/iac/README.md#deployment-modes)**.
+The reference region is `ap-south-1`, but you can deploy to **any** region — see
+**[Supported AWS Regions](aws/iac/README.md#supported-aws-regions)**.
+
 ## What's inside
 
 | Cloud | Manual guide | Terraform + Ansible | Status |
@@ -69,9 +85,11 @@ openvpn-cloud-lab/
 - **AWS only (SSH-free SSM management):** the **Session Manager plugin**, Python **`boto3`**, and the
   **`community.aws`** + **`amazon.aws`** Ansible collections (one-time install; see the AWS guide).
 
-> 💸 **Cost heads-up:** a VPN needs a small **always-on VM** + a **stable public IP**; the AWS IaC
-> path also creates a **NAT Gateway** (the priciest piece — optional, and flagged in the docs).
-> Budget a few dollars a month and **always tear down when you're done**.
+> 💸 **Cost heads-up:** a VPN needs a small **always-on VM** + a **stable public IP**. The default
+> **VPN-Only** mode bills just for those; **Extended Networking** adds a **NAT Gateway** (the priciest
+> piece — only created when `enable_private_networking = true`). Pricing varies by region/usage, so no
+> fixed dollar figure is quoted — see
+> **[Estimated AWS Costs](aws/iac/README.md#estimated-aws-costs)**. **Always tear down when you're done.**
 
 ## Quick start (AWS, automated)
 

@@ -14,8 +14,21 @@ OpenVPN setting below is taken directly from the repository source — nothing i
 This lab runs **OpenVPN Community Edition** (open-source) on a single Ubuntu 24.04 EC2 instance in a
 custom VPC, in AWS region **`ap-south-1`** (Mumbai). The server lives in a **public subnet** with an
 **Elastic IP**, accepts VPN clients on **UDP 1194**, hands them addresses from the **`10.8.0.0/24`**
-tunnel subnet, and **NATs** their traffic out to the internet. A **private subnet** with a **NAT
-Gateway** is created to model a realistic public+private VPC (it currently holds no workloads).
+tunnel subnet, and **NATs** their traffic out to the internet.
+
+This mirrors the IaC automation, which ships **two modes** (see
+[Deployment Modes](../iac/README.md#deployment-modes)):
+
+- **Mode 1 — VPN Only (default, `enable_private_networking = false`):** VPC + public subnet + Internet
+  Gateway + public route table + the OpenVPN EC2 + its Elastic IP. **No** private subnet, NAT Gateway,
+  NAT EIP, or private route table. This is the cheapest, fastest path and all you need for a working VPN.
+- **Mode 2 — Extended Networking (`enable_private_networking = true`):** *adds* a **private subnet**, a
+  **NAT Gateway** + its **NAT Elastic IP**, and a **private route table** to model a realistic
+  public+private VPC (the private subnet currently holds no workloads).
+
+> Optional: throughout this guide, the **private subnet**, **NAT Gateway**, **NAT Elastic IP**, and
+> **private route table** steps correspond to Mode 2 only (`enable_private_networking = true`). For a
+> default VPN-Only build, **skip** those steps.
 
 Management is done two ways, exactly as the automation intends:
 
@@ -38,7 +51,7 @@ Management is done two ways, exactly as the automation intends:
 | Availability Zone | `ap-south-1a` |
 | VPC CIDR | `10.0.0.0/16` |
 | Public subnet | `10.0.1.0/24` |
-| Private subnet | `10.0.2.0/24` |
+| Private subnet *(optional · Mode 2 only)* | `10.0.2.0/24` |
 | VPN client (tunnel) subnet | `10.8.0.0/24` |
 | Instance type | `t3.micro` |
 | AMI | latest Canonical Ubuntu **24.04 (Noble)** `amd64` HVM SSD |
@@ -50,6 +63,13 @@ Management is done two ways, exactly as the automation intends:
 | DNS pushed to clients | `8.8.8.8`, `8.8.4.4` |
 | Default client name | `admin_user` |
 
+> **Deploying in a different region?** This guide uses `ap-south-1`, but every step works in any AWS
+> region — substitute your region in the `--region` flags and use a matching Availability Zone (AZ
+> names are region-prefixed, e.g. `us-east-1a`). For region selection, the AZ/pricing/quota caveats,
+> and a migration checklist, see the IaC guide:
+> [Supported AWS Regions](../iac/README.md#supported-aws-regions) and
+> [Deploying To A Different AWS Region](../iac/README.md#deploying-to-a-different-aws-region).
+
 ---
 
 ## Architecture
@@ -57,6 +77,10 @@ Management is done two ways, exactly as the automation intends:
 The automation's resource naming uses the prefix `ovpn-dev` (`project_name = ovpn`,
 `environment = dev`). This guide uses the same names so a manual build is indistinguishable from the
 Terraform one.
+
+Solid boxes are the default **VPN-Only** build (Mode 1). The dashed block — private subnet, NAT
+Gateway, NAT EIP, private route table — is **optional** and only built in **Mode 2**
+(`enable_private_networking = true`).
 
 ```
    Your laptop (operator)                          AWS  (ap-south-1)
@@ -67,13 +91,18 @@ Terraform one.
  │ ovpn-admin.pem (SSH) ····┼··· TCP 22 ····┼··│  EIP · UDP 1194 · SSM agent         │ │
  │ (your IP /32 only)       │               │  │  tun0 10.8.0.0/24 · MASQUERADE      │ │
  └──────────────────────────┘               │  └───────────────────┬────────────────┘ │
-                                            │  IGW ◀─ public RT     │ NAT GW (private) │
-                                            │  ┌─────────── private 10.0.2.0/24 ──┐    │
-                                            │  │ (future private resources)   ────┼──▶ │
-                                            │  └──────────────────────────────────┘    │
+                                            │  IGW ◀─ public RT     ┊ NAT GW (optional)┊
+                                            │  ┌┄┄┄┄┄┄┄ private 10.0.2.0/24 ┄┄┄┄┄┄┐    ┊
+                                            │  ┊ (optional · Mode 2 ·             ┊    ┊
+                                            │  ┊  enable_private_networking=true) ─┼──▶ ┊
+                                            │  └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘    ┊
                                             └────────────────────────────────────────-─┘
-   VPN clients ── UDP 1194 ─▶ EIP ─▶ OpenVPN ─▶ tun 10.8.0.0/24 ─▶ NAT/MASQUERADE ─▶ internet
+   VPN clients ── UDP 1194 ─▶ EIP ─▶ OpenVPN ─▶ tun 10.8.0.0/24 ─▶ MASQUERADE ─▶ internet
 ```
+
+> Optional: the private subnet, NAT Gateway, NAT EIP, and private route table are only created when
+> `enable_private_networking = true` (Mode 2). The default VPN-Only build omits them; VPN client
+> traffic still reaches the internet via the OpenVPN host's MASQUERADE out through the public subnet.
 
 ---
 
@@ -86,14 +115,18 @@ configured by `../iac/ansible/`):
 
 - VPC `10.0.0.0/16` with DNS support + DNS hostnames enabled.
 - Public subnet `10.0.1.0/24` in `ap-south-1a`, **auto-assign public IP = on**.
-- Private subnet `10.0.2.0/24` in `ap-south-1a` (no auto-assign public IP).
 - Internet Gateway, attached to the VPC.
-- Elastic IP for NAT + a NAT Gateway in the **public** subnet.
 - Public route table (`0.0.0.0/0` → IGW) associated to the public subnet.
-- Private route table (`0.0.0.0/0` → NAT GW) associated to the private subnet.
 - Security group `ovpn-dev-openvpn-sg`: inbound UDP 1194 from anywhere, inbound TCP 22 from your
   `/32`, all outbound.
-- Security group `ovpn-dev-private-sg`: inbound all-from-VPC + all-from-VPN-clients, all outbound.
+
+> Optional: the following are only created in **Mode 2** (`enable_private_networking = true`). For a
+> default VPN-Only build, **skip** them.
+
+- Private subnet `10.0.2.0/24` in `ap-south-1a` (no auto-assign public IP). *(Optional · Mode 2)*
+- Elastic IP for NAT + a NAT Gateway in the **public** subnet. *(Optional · Mode 2)*
+- Private route table (`0.0.0.0/0` → NAT GW) associated to the private subnet. *(Optional · Mode 2)*
+- Security group `ovpn-dev-private-sg`: inbound all-from-VPC + all-from-VPN-clients, all outbound. *(Optional · Mode 2)*
 - Latest Canonical Ubuntu 24.04 AMI lookup.
 - S3 bucket `<account-id>-ovpn-ssm-transfer` (public access fully blocked) — used only by the
   Ansible `aws_ssm` file-transfer plugin. **In a manual build you can skip this bucket** (you'll move
@@ -160,6 +193,10 @@ curl -s https://checkip.amazonaws.com
 
 ### 1. High-Level Architecture (graph TD)
 
+> Optional: the **NAT Gateway**, **private subnet**, and **private route table** nodes below
+> (dashed/marked *optional · Mode 2*) are only created when `enable_private_networking = true`. The
+> default VPN-Only build omits them.
+
 ```mermaid
 graph TD
     Operator["Operator laptop<br/>AWS Console + CLI"]
@@ -170,13 +207,13 @@ graph TD
       subgraph VPC["VPC ovpn-dev-vpc 10.0.0.0/16"]
         subgraph Public["Public subnet 10.0.1.0/24 (ap-south-1a)"]
           EC2["EC2 ovpn-dev-openvpn<br/>Ubuntu 24.04 t3.micro<br/>EIP · UDP 1194 · tun0 10.8.0.0/24<br/>SSM agent · src/dst check OFF"]
-          NAT["NAT Gateway<br/>ovpn-dev-nat + EIP"]
+          NAT["NAT Gateway (optional · Mode 2)<br/>ovpn-dev-nat + EIP<br/>enable_private_networking=true"]
         end
-        subgraph Private["Private subnet 10.0.2.0/24 (ap-south-1a)"]
+        subgraph Private["Private subnet (optional · Mode 2)<br/>10.0.2.0/24 (ap-south-1a)"]
           Future["(future private resources)"]
         end
         PubRT["Public RT<br/>0.0.0.0/0 -> IGW"]
-        PrivRT["Private RT<br/>0.0.0.0/0 -> NAT"]
+        PrivRT["Private RT (optional · Mode 2)<br/>0.0.0.0/0 -> NAT"]
       end
       IAM["IAM role ovpn-dev-ssm-role<br/>AmazonSSMManagedInstanceCore"]
       SSM["AWS SSM Session Manager"]
@@ -185,12 +222,15 @@ graph TD
     Operator -->|HTTPS 443| SSM --> EC2
     Operator -.->|SSH 22 from your /32| EC2
     Client -->|UDP 1194| EC2
-    EC2 --> NAT --> IGW
+    EC2 -.->|Mode 2 only| NAT -.-> IGW
     EC2 --> IGW
     IAM --- EC2
     PubRT --- Public
-    PrivRT --- Private
-    Future --> PrivRT
+    PrivRT -.- Private
+    Future -.-> PrivRT
+
+    classDef optional stroke-dasharray:5 5,stroke:#888;
+    class NAT,Private,Future,PrivRT optional;
 ```
 
 ### 2. Network Flow (graph LR)
@@ -284,8 +324,8 @@ aws ec2 describe-vpcs --region ap-south-1 \
 
 ### Create Public Subnet
 
-**Purpose:** Holds the OpenVPN EC2 and the NAT Gateway; gets public IPs and a route to the IGW.
-Matches `aws_subnet.public`.
+**Purpose:** Holds the OpenVPN EC2 (and, in Mode 2, the NAT Gateway); gets public IPs and a route to
+the IGW. Matches `aws_subnet.public`. Created in **both** modes.
 
 **AWS Console Navigation:** VPC → *Subnets* → **Create subnet**.
 
@@ -324,8 +364,11 @@ aws ec2 describe-subnets --region ap-south-1 \
 
 ### Create Private Subnet
 
+> Optional: only created when `enable_private_networking = true` (Mode 2). **Skip this step for a
+> default VPN-Only build.**
+
 **Purpose:** For future protected workloads; reaches the internet only via the NAT Gateway. Matches
-`aws_subnet.private`.
+`aws_subnet.private` (`count = var.enable_private_networking ? 1 : 0`).
 
 **AWS Console Navigation:** VPC → *Subnets* → **Create subnet**.
 
@@ -362,8 +405,8 @@ aws ec2 describe-subnets --region ap-south-1 \
 
 ### Create Internet Gateway
 
-**Purpose:** Gives the public subnet (and the NAT Gateway) a path to the internet. Matches
-`aws_internet_gateway.this`.
+**Purpose:** Gives the public subnet (and, in Mode 2, the NAT Gateway) a path to the internet. Matches
+`aws_internet_gateway.this`. Created in **both** modes.
 
 **AWS Console Navigation:** VPC → *Internet gateways* → **Create internet gateway**.
 
@@ -425,13 +468,17 @@ aws ec2 describe-internet-gateways --region ap-south-1 \
 
 ### Create NAT Gateway
 
-**Purpose:** Outbound-only internet for the **private** subnet. Lives in the **public** subnet and
-needs its own Elastic IP. Matches `aws_eip.nat` + `aws_nat_gateway.this`.
+> Optional: only created when `enable_private_networking = true` (Mode 2). **Skip this step for a
+> default VPN-Only build.**
 
-> **Cost note:** the NAT Gateway + its EIP is the dominant cost (~$45/mo). It exists only to model a
-> realistic public+private VPC and serves the (currently empty) private subnet. For a VPN-only lab
-> you may skip it — but to faithfully reproduce the automation, create it. See
-> [Cost / cleanup](#appendix).
+**Purpose:** Outbound-only internet for the **private** subnet. Lives in the **public** subnet and
+needs its own Elastic IP. Matches `aws_eip.nat` + `aws_nat_gateway.this`
+(`count = var.enable_private_networking ? 1 : 0`).
+
+> **Cost note:** the NAT Gateway + its NAT Elastic IP is the **dominant cost** of Extended mode (billed
+> per hour *and* per GB processed). It exists only to model a realistic public+private VPC and serves
+> the (currently empty) private subnet. For a VPN-only lab, skip it. Pricing varies by region/usage —
+> see the authoritative **[Estimated AWS Costs](../iac/README.md#estimated-aws-costs)**.
 
 **AWS Console Navigation:** VPC → *NAT gateways* → **Create NAT gateway**.
 
@@ -469,8 +516,14 @@ aws ec2 describe-nat-gateways --region ap-south-1 \
 
 ### Configure Route Tables
 
-**Purpose:** Two route tables — public (default route to IGW) and private (default route to NAT GW)
-— each associated to its subnet. Matches `aws_route_table.public/private` and their associations.
+**Purpose:** The **public** route table (default route to IGW, associated to the public subnet) is
+created in **both** modes. The **private** route table (default route to NAT GW, associated to the
+private subnet) is **optional — Mode 2 only**. Matches `aws_route_table.public` (always) and
+`aws_route_table.private` (`count = var.enable_private_networking ? 1 : 0`) plus their associations.
+
+> Optional: the **private** route table rows below are only created when
+> `enable_private_networking = true` (Mode 2). **For a default VPN-Only build, create only the public
+> route table** and skip the private one.
 
 **AWS Console Navigation:** VPC → *Route tables*.
 
@@ -512,7 +565,7 @@ aws ec2 describe-route-tables --region ap-south-1 \
 ```
 
 - [ ] Public RT: `0.0.0.0/0` → IGW; associated to the public subnet.
-- [ ] Private RT: `0.0.0.0/0` → NAT GW; associated to the private subnet.
+- [ ] *(Mode 2 only)* Private RT: `0.0.0.0/0` → NAT GW; associated to the private subnet.
 
 ### Validate Networking
 
@@ -529,10 +582,11 @@ aws ec2 describe-nat-gateways --region ap-south-1 \
 
 - [ ] VPC `10.0.0.0/16` with DNS support + hostnames.
 - [ ] Public subnet `10.0.1.0/24` (`ap-south-1a`, auto-assign public IPv4 on).
-- [ ] Private subnet `10.0.2.0/24` (`ap-south-1a`, no public IPv4).
 - [ ] IGW attached to the VPC.
-- [ ] NAT Gateway available in the public subnet with an EIP.
-- [ ] Public RT → IGW (associated to public subnet); Private RT → NAT (associated to private subnet).
+- [ ] Public RT → IGW (associated to public subnet).
+- [ ] *(Mode 2 only)* Private subnet `10.0.2.0/24` (`ap-south-1a`, no public IPv4).
+- [ ] *(Mode 2 only)* NAT Gateway available in the public subnet with an EIP.
+- [ ] *(Mode 2 only)* Private RT → NAT (associated to private subnet).
 
 ---
 
@@ -608,7 +662,11 @@ internet. Matches `aws_security_group.openvpn` egress.
 
 #### Private security group (`ovpn-dev-private-sg`)
 
-Create a second SG to match `aws_security_group.private` (used by future private-subnet workloads):
+> Optional: only created when `enable_private_networking = true` (Mode 2). **Skip for a default
+> VPN-Only build.**
+
+Create a second SG to match `aws_security_group.private`
+(`count = var.enable_private_networking ? 1 : 0`, used by future private-subnet workloads):
 
 | Direction | Type | Protocol | Source/Dest | Description |
 |---|---|---|---|---|
@@ -636,7 +694,7 @@ aws ec2 describe-security-groups --region ap-south-1 \
 - [ ] `ovpn-dev-openvpn-sg`: inbound UDP 1194 from `0.0.0.0/0`.
 - [ ] `ovpn-dev-openvpn-sg`: inbound TCP 22 from your `/32` only (**not** `0.0.0.0/0`).
 - [ ] `ovpn-dev-openvpn-sg`: outbound all to `0.0.0.0/0`.
-- [ ] `ovpn-dev-private-sg`: inbound all-from-`10.0.0.0/16` + all-from-`10.8.0.0/24`; outbound all.
+- [ ] *(Mode 2 only)* `ovpn-dev-private-sg`: inbound all-from-`10.0.0.0/16` + all-from-`10.8.0.0/24`; outbound all.
 
 ---
 
@@ -1334,11 +1392,15 @@ cat /var/log/openvpn/status.log
 
 ## Phase 6 - Cleanup and Resource Destruction
 
-> **Why this matters.** Several resources keep billing **even when idle**: the **NAT Gateway**
-> (~$0.045/hr ≈ **$32+/month** plus data processing), each **Elastic IP** while allocated
-> (~$0.005/hr ≈ $3.6/mo), and **EBS volumes**. Terminating the EC2 instance alone does **not** stop
-> these charges. This phase removes everything in a **dependency-safe order** so nothing is orphaned
-> and your account returns to its original state.
+> **Why this matters.** Several resources keep billing **even when idle**: the **NAT Gateway** (Mode 2
+> only — billed per hour *and* per GB processed), each **Elastic IP** while allocated (an idle EIP
+> bills hourly), and **EBS volumes**. Terminating the EC2 instance alone does **not** stop these
+> charges. This phase removes everything in a **dependency-safe order** so nothing is orphaned and your
+> account returns to its original state. For rates, see the authoritative
+> **[Estimated AWS Costs](../iac/README.md#estimated-aws-costs)** (pricing varies by region/usage).
+>
+> **Mode 1 (VPN-Only) note:** if you skipped the private subnet / NAT Gateway / NAT EIP / private route
+> table, also skip the corresponding cleanup steps below (steps 7–8 and the private subnet/RT removals).
 
 > **Order matters.** AWS refuses to delete a resource while something still depends on it (you get
 > `DependencyViolation`). Remove from the inside out: **clients → server EIP → instance → EBS →
@@ -1392,7 +1454,8 @@ sudo tar -czf /tmp/openvpn-backup.tgz /etc/openvpn/server /etc/openvpn/easy-rsa/
 
 ### 3. Release Elastic IP (server)
 
-**Purpose:** Free the server's static public IP. **Allocated Elastic IPs bill (~$0.005/hr ≈ $3.6/mo)** whether attached or not.
+**Purpose:** Free the server's static public IP. **Allocated Elastic IPs bill hourly** whether attached
+or not (rate varies by region — see [Estimated AWS Costs](../iac/README.md#estimated-aws-costs)).
 
 **AWS Console Navigation:** `EC2 → Network & Security → Elastic IPs`
 
@@ -1434,7 +1497,8 @@ sudo tar -czf /tmp/openvpn-backup.tgz /etc/openvpn/server /etc/openvpn/easy-rsa/
 
 ### 5. Delete EBS Volumes
 
-**Purpose:** Remove leftover storage. **Unattached EBS volumes still bill** (~$0.092/GiB-month for `gp3`).
+**Purpose:** Remove leftover storage. **Unattached EBS volumes still bill** (per-GiB-month, rate varies
+by region — see [Estimated AWS Costs](../iac/README.md#estimated-aws-costs)).
 
 **AWS Console Navigation:** `EC2 → Elastic Block Store → Volumes`
 
@@ -1459,7 +1523,7 @@ sudo tar -czf /tmp/openvpn-backup.tgz /etc/openvpn/server /etc/openvpn/easy-rsa/
 **Steps:**
 
 1. Select **`ovpn-dev-openvpn-sg`** → **Actions → Delete security groups** → confirm.
-2. Repeat for **`ovpn-dev-private-sg`**.
+2. *(Mode 2 only)* Repeat for **`ovpn-dev-private-sg`**.
 3. Leave the VPC's `default` group — it is removed with the VPC (step 12).
 
 > **Common error — `DependencyViolation`.** A security group can't be deleted while a network interface
@@ -1475,11 +1539,15 @@ sudo tar -czf /tmp/openvpn-backup.tgz /etc/openvpn/server /etc/openvpn/easy-rsa/
 
 ### 7. Delete NAT Gateway
 
-**Purpose:** Stop the **single most expensive** resource in the lab.
+> Optional: only exists if you built Mode 2 (`enable_private_networking = true`). **Skip if you ran a
+> default VPN-Only build.**
+
+**Purpose:** Stop the **single most expensive** resource in the lab (Extended mode only).
 
 > ⚠️ NAT Gateways continue generating charges until deleted.
 
-> 💸 **Estimated cost:** ~**$0.045/hour (~$32+/month)** plus per-GB data processing — billed continuously until deleted.
+> 💸 **Cost:** the NAT Gateway is billed per hour *and* per GB processed — billed continuously until
+> deleted. Rates vary by region — see [Estimated AWS Costs](../iac/README.md#estimated-aws-costs).
 
 **AWS Console Navigation:** `VPC → Virtual private cloud → NAT gateways`
 
@@ -1499,6 +1567,9 @@ sudo tar -czf /tmp/openvpn-backup.tgz /etc/openvpn/server /etc/openvpn/easy-rsa/
 - [ ] Hourly NAT charges stopped
 
 ### 8. Release NAT Elastic IP
+
+> Optional: only exists if you built Mode 2 (`enable_private_networking = true`). **Skip if you ran a
+> default VPN-Only build.**
 
 **Purpose:** Free the NAT Gateway's Elastic IP.
 
@@ -1521,22 +1592,22 @@ sudo tar -czf /tmp/openvpn-backup.tgz /etc/openvpn/server /etc/openvpn/easy-rsa/
 
 ### 9. Delete Route Table Entries
 
-**Purpose:** Remove the custom routing (public → IGW, private → NAT).
+**Purpose:** Remove the custom routing (public → IGW always; private → NAT in Mode 2 only).
 
 **AWS Console Navigation:** `VPC → Virtual private cloud → Route tables`
 
 **Steps:**
 
 1. Select **`ovpn-dev-public-rt`** → **Routes** tab → the `0.0.0.0/0 → igw-…` entry is now dangling; **Edit routes → remove** it (it is also removed when you delete the table).
-2. Select **`ovpn-dev-private-rt`** → its `0.0.0.0/0 → nat-…` entry became a **blackhole** when the NAT was deleted — remove it.
+2. *(Mode 2 only)* Select **`ovpn-dev-private-rt`** → its `0.0.0.0/0 → nat-…` entry became a **blackhole** when the NAT was deleted — remove it.
 3. For each custom table: **Actions → Delete route table** (first **Edit subnet associations → remove** any subnet, or do that in step 11). The **main** route table is deleted with the VPC.
 
-**Expected Result:** Both custom route tables and their routes are gone.
+**Expected Result:** The public route table and its route are gone (plus the private route table, if you built Mode 2).
 
 **Validation:**
 
 - [ ] `ovpn-dev-public-rt` removed
-- [ ] `ovpn-dev-private-rt` removed
+- [ ] *(Mode 2 only)* `ovpn-dev-private-rt` removed
 
 ### 10. Detach and Delete Internet Gateway
 
@@ -1562,23 +1633,23 @@ sudo tar -czf /tmp/openvpn-backup.tgz /etc/openvpn/server /etc/openvpn/easy-rsa/
 
 ### 11. Delete Subnets
 
-**Purpose:** Remove the public and private subnets.
+**Purpose:** Remove the public subnet (always) and the private subnet (Mode 2 only).
 
 **AWS Console Navigation:** `VPC → Virtual private cloud → Subnets`
 
 **Steps:**
 
 1. Select **`ovpn-dev-public-subnet`** (`10.0.1.0/24`) → **Actions → Delete subnet** → confirm.
-2. Select **`ovpn-dev-private-subnet`** (`10.0.2.0/24`) → **Actions → Delete subnet** → confirm.
+2. *(Mode 2 only)* Select **`ovpn-dev-private-subnet`** (`10.0.2.0/24`) → **Actions → Delete subnet** → confirm.
 
 > A subnet won't delete while it still has a network interface (the instance or NAT Gateway). Complete steps 4 and 7 first.
 
-**Expected Result:** Both subnets are gone.
+**Expected Result:** The public subnet is gone (plus the private subnet, if you built Mode 2).
 
 **Validation:**
 
 - [ ] Public subnet deleted
-- [ ] Private subnet deleted
+- [ ] *(Mode 2 only)* Private subnet deleted
 
 ### 12. Delete VPC
 
@@ -1665,14 +1736,14 @@ Final confirmation that the lab is completely gone:
 
 - [ ] VPC `10.0.0.0/16` (DNS support + hostnames).
 - [ ] Public subnet `10.0.1.0/24` (`ap-south-1a`, auto-assign public IPv4).
-- [ ] Private subnet `10.0.2.0/24` (`ap-south-1a`).
-- [ ] IGW attached; NAT GW available in the public subnet with EIP.
-- [ ] Public RT → IGW; Private RT → NAT; correct associations.
+- [ ] IGW attached; Public RT → IGW; correct association.
+- [ ] *(Mode 2 only)* Private subnet `10.0.2.0/24` (`ap-south-1a`).
+- [ ] *(Mode 2 only)* NAT GW available in the public subnet with EIP; Private RT → NAT; correct association.
 
 **Security**
 
 - [ ] `ovpn-dev-openvpn-sg`: UDP 1194 from `0.0.0.0/0`; TCP 22 from your `/32`; all egress.
-- [ ] `ovpn-dev-private-sg`: from-VPC + from-VPN-clients inbound; all egress.
+- [ ] *(Mode 2 only)* `ovpn-dev-private-sg`: from-VPC + from-VPN-clients inbound; all egress.
 
 **EC2**
 
@@ -1784,6 +1855,31 @@ Final confirmation that the lab is completely gone:
   (`./easyrsa build-client-full <user> nopass`) and reassemble their `.ovpn`. Names must be
   alphanumeric / `-` / `_`. If a user's profile leaked, revoke the cert
   (`./easyrsa revoke <user>` + `gen-crl`) and re-issue.
+
+### Region-Specific Troubleshooting
+
+Building in a region other than `ap-south-1`? These are the region-related snags (and where the IaC
+guide documents each in full):
+
+- **No matching AMI / image not found.** The Canonical Ubuntu 24.04 AMI ID differs per region. In the
+  manual flow you look it up dynamically — `aws ec2 describe-images --region <r> --owners 099720109477
+  --filters 'Name=name,Values=ubuntu/images/hvm-ssd*/ubuntu-noble-24.04-amd64-server-*'` — never paste
+  a fixed AMI ID from another region.
+- **Instance type unavailable in this region/AZ.** `t3.micro` isn't offered everywhere. Check with
+  `aws ec2 describe-instance-type-offerings --region <r> --filters Name=instance-type,Values=t3.micro`
+  and pick a supported type or AZ.
+- **AZ not found.** Subnet creation fails if your AZ doesn't belong to the region (e.g. leaving
+  `ap-south-1a` after switching to `us-east-1`). List valid AZs with
+  `aws ec2 describe-availability-zones --region <r>`.
+- **Insufficient Elastic IP quota / `AddressLimitExceeded`.** New accounts often allow only 5 Elastic
+  IPs per region (the optional NAT Gateway needs a second one). Release unused EIPs or raise the limit
+  in **Service Quotas → EC2**.
+- **Service quota exceeded** (VPC/EIP/instances). Quotas are per-region; delete unused resources or
+  request an increase in the **Service Quotas** console for that region.
+
+See the IaC guide for symptoms/root-cause/resolution detail:
+[Region-Specific Troubleshooting](../iac/README.md#region-specific-troubleshooting),
+[Regional Considerations](../iac/README.md#regional-considerations).
 
 ---
 
@@ -1914,22 +2010,22 @@ journalctl -u openvpn-server@server -n 50 --no-pager
 
 ### C. Cost and cleanup
 
-Approximate monthly cost in `ap-south-1` (matches `../iac/README.md`):
+For the cost breakdown, see the **single authoritative section**:
+**[`../iac/README.md` → Estimated AWS Costs](../iac/README.md#estimated-aws-costs)**. It lists costs
+**by resource type** for **VPN Only** vs **Extended** mode, the factors pricing *varies by* (region,
+instance type, NAT Gateway usage, data transfer, Elastic IP usage), and points to the AWS Pricing
+Calculator. **No fixed monthly dollar figure is quoted** because pricing varies by region and over time.
 
-| Resource | ~Cost/mo | Required for VPN? |
-|---|---|---|
-| NAT Gateway + its EIP | **~$45** | **No** — serves only the empty private subnet |
-| EC2 `t3.micro` | ~$7.5 (free-tier yr 1) | Yes |
-| Elastic IP (server) | ~$3.6 | Yes |
-| EBS gp3 8 GiB | ~$0.64 | Yes |
-| S3 transfer bucket | cents | Optional |
+In short: **VPN-Only (Mode 1, the default)** bills only for the EC2 instance, its Elastic IP, and a
+tiny EBS/VPC/S3 footprint. **Extended (Mode 2)** adds the **NAT Gateway + NAT Elastic IP + data
+processing/transfer** — the NAT Gateway being the dominant cost. The biggest saving is simply staying
+in VPN-Only mode (skip the private subnet + NAT Gateway + NAT EIP + private route table).
 
-**Biggest saving (~$45/mo):** skip/delete the NAT Gateway + its EIP + the private route — the VPN
-host lives in the public subnet and doesn't need them. **Always tear everything down when finished**
-to stop billing (especially idle Elastic IPs and the NAT Gateway). Manual teardown order: disconnect
-clients → terminate the instance → release both Elastic IPs → delete NAT Gateway → detach/delete IGW
-→ delete subnets, route tables, security groups → delete the VPC → delete the IAM role/instance
-profile and (optional) S3 bucket → delete the `ovpn-admin` key pair.
+**Always tear everything down when finished** to stop billing (especially idle Elastic IPs and, in
+Mode 2, the NAT Gateway). Manual teardown order: disconnect clients → release the server Elastic IP →
+terminate the instance → delete EBS → delete security groups → *(Mode 2)* delete NAT Gateway → *(Mode
+2)* release NAT EIP → delete route tables → detach/delete IGW → delete subnets → delete the VPC →
+delete the IAM role/instance profile and (optional) S3 bucket → delete the `ovpn-admin` key pair.
 
 ```bash
 # Confirm nothing bills after cleanup
